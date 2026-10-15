@@ -100,7 +100,8 @@ enum BIT_INTERNET {
 EventGroupHandle_t xLedEventGroup;
 EventGroupHandle_t xInternetEventGroup;
 
-#define WIFI_BACKOFF_MIN_MS  5000
+// First join often fails while BLE init shares the radio; retry fast, then back off.
+#define WIFI_BACKOFF_MIN_MS  1000
 #define WIFI_BACKOFF_MAX_MS  300000
 static uint32_t wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;
 static esp_timer_handle_t wifi_retry_timer;
@@ -171,6 +172,9 @@ static char s_ip_ppp[16]  = "";
 
 #define RPC_FRESHNESS_SEC   10
 #define BLE_FRESHNESS_SEC   60
+
+_Static_assert(sizeof(CONFIG_VMFLOW_MQTT_BROKER_URI) > 1, "Set VMflow -> Backend -> MQTT broker URI in menuconfig");
+_Static_assert(sizeof(CONFIG_VMFLOW_DEV_PASSKEY) == 1 || sizeof(CONFIG_VMFLOW_DEV_PASSKEY) == PASSKEY_LEN + 1, "VMflow -> Development provisioning -> passkey must be exactly 18 characters");
 
 esp_mqtt_client_handle_t mqtt_client = NULL;
 
@@ -436,10 +440,10 @@ void mdb_cashless_task(void *pvParameters) {
 				ble_encode_with_passkey(0x0c, item_price, item_number, payload);
 				ble_notify_send((char*) payload, sizeof(payload));
 
-                char topic[64], msg[64], line[160];
+                char topic[128], msg[64], line[160];
                 snprintf(msg, sizeof(msg), "%u,%u:%lld", item_price, item_number, (long long) time(NULL));
                 rpc_sign_text(msg, line, sizeof(line));
-                snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/vend_fail", my_subdomain);
+                snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/vend_fail", my_subdomain);
                 esp_mqtt_client_enqueue(mqtt_client, topic, line, 0, 1, 0, 1);
 
 				break;
@@ -464,11 +468,11 @@ void mdb_cashless_task(void *pvParameters) {
 
 				uint32_t price_wire = TO_SCALE_FACTOR( FROM_SCALE_FACTOR(item_price, CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES), 1, 2);
 
-				char topic[64], msg[64], line[160];
+				char topic[128], msg[64], line[160];
 				snprintf(msg, sizeof(msg), "%lu:%u:%lld", (unsigned long) price_wire, item_number, (long long) time(NULL));
 				rpc_sign_text(msg, line, sizeof(line));
 
-				snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/sale", my_subdomain);
+				snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/sale", my_subdomain);
 				esp_mqtt_client_enqueue(mqtt_client, topic, line, 0, 1, 0, 1);
 
 				ESP_LOGI( TAG, "CASH_SALE");
@@ -545,7 +549,7 @@ void mdb_cashless_task(void *pvParameters) {
 /*
  * Agent-facing interfaces (MQTT, every message signed with the per-device passkey).
  *
- * Inbound RPC — topic <sub>.vmflow.xyz/rpc, payload "<cmd>:<params>:<ts>:<hmac_hex>".
+ * Inbound RPC — topic <sub>.<CONFIG_VMFLOW_TOPIC_DOMAIN>/rpc, payload "<cmd>:<params>:<ts>:<hmac_hex>".
  *   hmac = HMAC-SHA256(passkey, everything-before-the-last-colon) in lowercase hex;
  *   <ts> is Unix seconds, accepted only within RPC_FRESHNESS_SEC. <params> is fixed-width
  *   (never empty): commands without an argument send "-" as a sentinel. Commands:
@@ -644,11 +648,11 @@ void led_status_task(void *pvParameters) {
 }
 
 void ble_pax_event_handler(uint16_t devices_count){
-    char topic[64], msg[48], line[128];
+    char topic[128], msg[48], line[128];
     snprintf(msg, sizeof(msg), "%u:%lld", devices_count, (long long) time(NULL));
     rpc_sign_text(msg, line, sizeof(line));
 
-    snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/paxcounter", my_subdomain);
+    snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/paxcounter", my_subdomain);
     esp_mqtt_client_enqueue(mqtt_client, topic, line, 0, 1, 0, 1);
 }
 
@@ -667,8 +671,8 @@ void ble_event_handler(char *ble_payload) {
 			nvs_set_str(handle, "domain", my_subdomain);
 			nvs_commit(handle);
 
-			char myhost[64];
-			snprintf(myhost, sizeof(myhost), "%s.vmflow.xyz", my_subdomain);
+			char myhost[128];
+			snprintf(myhost, sizeof(myhost), "%s." CONFIG_VMFLOW_TOPIC_DOMAIN, my_subdomain);
 
 			ble_set_device_name(myhost);
 
@@ -692,7 +696,9 @@ void ble_event_handler(char *ble_payload) {
 
             xEventGroupSetBits(xLedEventGroup, BIT_STATUS_PSSKEY | BIT_STATUS_TRIGGER);
 
+#if CONFIG_VMFLOW_LOG_SECRETS
 			ESP_LOGI( TAG, "PASSKEY= %s", my_passkey);
+#endif
 		}
 		nvs_close(handle);
 
@@ -734,13 +740,15 @@ void ble_event_handler(char *ble_payload) {
 
 		esp_wifi_connect();
 
+#if CONFIG_VMFLOW_LOG_SECRETS
 	    ESP_LOGI( TAG, "PASSWORD= %s", wifi_config.sta.password);
+#endif
 		break;
     }
 	}
 }
 
-// OTA worker: pulls the app image from a GitHub release asset over HTTPS, writes the inactive slot, then reboots.
+// OTA worker: pulls the app image from CONFIG_VMFLOW_OTA_BASE_URL over HTTPS, writes the inactive slot, then reboots.
 // Runs in its own task because the download blocks for tens of seconds and must not stall the MQTT handler.
 static void ota_task(void *arg) {
 	const char *url = (const char *) arg;
@@ -773,7 +781,7 @@ static void ota_task(void *arg) {
 static void rpc_publish_info(void) {
 	const esp_app_desc_t *app = esp_app_get_description();
 
-	char topic[64], json[384];
+	char topic[128], json[384];
 	int n = snprintf(json, sizeof(json),
 		"{\"version\":\"%s\",\"uptime_s\":%lld,"
 		"\"free_heap\":%lu,\"min_free_heap\":%lu,\"machine_state\":%d,"
@@ -789,7 +797,7 @@ static void rpc_publish_info(void) {
 		(long long) last_vend_success_time,
 		s_ip_wifi, s_ip_ppp);
 
-	snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/rpc/info", my_subdomain);
+	snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/rpc/info", my_subdomain);
 	esp_mqtt_client_enqueue(mqtt_client, topic, json, n, 1, 0, 1);
 }
 
@@ -800,12 +808,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 	switch ((esp_mqtt_event_id_t) event_id) {
 	case MQTT_EVENT_CONNECTED:
 
-    	char topic[64], buf[32];
-    	snprintf(topic, sizeof(topic), "%s.vmflow.xyz/#", my_subdomain);
+    	char topic[128], buf[32];
+    	snprintf(topic, sizeof(topic), "%s." CONFIG_VMFLOW_TOPIC_DOMAIN "/#", my_subdomain);
 
     	esp_mqtt_client_subscribe(mqtt_client, topic, 0);
 
-    	snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/status", my_subdomain);
+    	snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/status", my_subdomain);
     	snprintf(buf, sizeof(buf), "online,%d", (int)esp_reset_reason());
     	esp_mqtt_client_enqueue(mqtt_client, topic, buf, 0, 1, 1, 1);
 
@@ -819,8 +827,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 		break;
 	case MQTT_EVENT_SUBSCRIBED: {
-		char sub_topic[64];
-		snprintf(sub_topic, sizeof(sub_topic), "%s.vmflow.xyz/#", my_subdomain);
+		char sub_topic[128];
+		snprintf(sub_topic, sizeof(sub_topic), "%s." CONFIG_VMFLOW_TOPIC_DOMAIN "/#", my_subdomain);
 		ESP_LOGI(TAG, "mqtt subscribed: %s", sub_topic);
 		break;
 	}
@@ -865,8 +873,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 			bool has_args = (args[0] != '\0' && strcmp(args, "-") != 0);
 
-            char topic_confirm[64];
-            snprintf(topic_confirm, sizeof(topic_confirm), "domain.vmflow.xyz/%s/rpc/confirm", my_subdomain);
+            char topic_confirm[128];
+            snprintf(topic_confirm, sizeof(topic_confirm), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/rpc/confirm", my_subdomain);
 
 			if (strcmp(cmd, "dex") == 0) {
 				request_telemetry_data(NULL);
@@ -889,8 +897,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 esp_mqtt_client_enqueue(mqtt_client, topic_confirm, "ok", 0, 1, 0, 1);
 				ESP_LOGI(TAG, "RPC out-of-sequence queued");
 			} else if (strcmp(cmd, "echo") == 0) {
-				char topic[64], buf[24];
-				snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/rpc/echo", my_subdomain);
+				char topic[128], buf[24];
+				snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/rpc/echo", my_subdomain);
 				snprintf(buf, sizeof(buf), "%u", ts);
 				esp_mqtt_client_enqueue(mqtt_client, topic, buf, 0, 0, 0, 1);
 				ESP_LOGI(TAG, "RPC echo");
@@ -906,12 +914,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 				vTaskDelay(pdMS_TO_TICKS(500));
 				esp_restart();
 			} else if (strcmp(cmd, "ota") == 0) {
-				// "ota:-" -> latest release; "ota:<tag>" -> pinned tag.
-				static char ota_url[160];
-				if (has_args)
-					snprintf(ota_url, sizeof(ota_url), "https://github.com/nodestark/mdb-esp32-cashless/releases/download/%s/mdb-slave-esp32s3.bin", args);
-				else
-					snprintf(ota_url, sizeof(ota_url), "https://github.com/nodestark/mdb-esp32-cashless/releases/latest/download/mdb-slave-esp32s3.bin");
+				// "ota:-" -> <base>/latest/...; "ota:<tag>" -> <base>/<tag>/... Empty base disables OTA.
+				const char *tag = has_args ? args : "latest";
+				if (sizeof(CONFIG_VMFLOW_OTA_BASE_URL) <= 1 || strspn(tag, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") != strlen(tag)) {
+					esp_mqtt_client_enqueue(mqtt_client, topic_confirm, "rejected", 0, 1, 0, 1);
+					ESP_LOGW(TAG, "RPC ota rejected (disabled or bad tag)");
+					break;
+				}
+
+				static char ota_url[256];
+				snprintf(ota_url, sizeof(ota_url), CONFIG_VMFLOW_OTA_BASE_URL "/%s/mdb-slave-esp32s3.bin", tag);
 
                 esp_mqtt_client_enqueue(mqtt_client, topic_confirm, "ok", 0, 1, 0, 1);
 				ESP_LOGW(TAG, "RPC ota: %s", ota_url);
@@ -975,7 +987,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         wifi_backoff_ms = WIFI_BACKOFF_MIN_MS;   // reset na conexão
         break;
     case WIFI_EVENT_STA_DISCONNECTED:
-        ESP_LOGW(TAG, "WiFi disconnected, retry in %lu ms", wifi_backoff_ms);
+        ESP_LOGW(TAG, "WiFi disconnected (reason %d), retry in %lu ms", ((wifi_event_sta_disconnected_t*) event_data)->reason, wifi_backoff_ms);
         esp_timer_start_once(wifi_retry_timer, (uint64_t) wifi_backoff_ms * 1000);
         wifi_backoff_ms *= 2;
         if (wifi_backoff_ms > WIFI_BACKOFF_MAX_MS) wifi_backoff_ms = WIFI_BACKOFF_MAX_MS;
@@ -983,6 +995,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+#if CONFIG_VMFLOW_MODEM_ENABLE
 static void sim7080g_pulse_power(void) {
     gpio_set_level(PIN_SIM7080G_PWR, 1);
     vTaskDelay(pdMS_TO_TICKS(1200));
@@ -1008,6 +1021,7 @@ static esp_err_t sim7080g_wait_registered(esp_modem_dce_t *dce) {
 
     return ESP_ERR_TIMEOUT;
 }
+#endif
 
 // Owns SIM7080G + MQTT lifecycle. MQTT stays off while the modem (re)connects:
 // on IP_EVENT_PPP_LOST_IP the task stops MQTT and re-runs the modem bring-up.
@@ -1015,6 +1029,7 @@ static void sim7080g_task(void *pvParameters) {
     gpio_set_direction(PIN_SIM7080G_PWR, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_SIM7080G_PWR, 0);
 
+#if CONFIG_VMFLOW_MODEM_ENABLE
     esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_config.uart_config.port_num   = UART_NUM_2;
     dte_config.uart_config.baud_rate  = 115200;
@@ -1031,13 +1046,16 @@ static void sim7080g_task(void *pvParameters) {
 
     esp_modem_dce_t *dce = esp_modem_new_dev(ESP_MODEM_DCE_SIM7070, &dte_config, &dce_config, ppp_netif);
     assert(dce);
+#else
+    ESP_LOGI(TAG, "modem probe disabled, Wi-Fi only");
+#endif
 
     //-------------------------- MQTT --------------------------//
-    char lwt_topic[64];
-    snprintf(lwt_topic, sizeof(lwt_topic), "domain.vmflow.xyz/%s/status", my_subdomain);
+    char lwt_topic[128];
+    snprintf(lwt_topic, sizeof(lwt_topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/status", my_subdomain);
 
     const esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://mqtt.vmflow.xyz",
+        .broker.address.uri = CONFIG_VMFLOW_MQTT_BROKER_URI,
         .session.last_will.topic = lwt_topic,
         .session.last_will.msg = "offline",
         .session.last_will.qos = 1,
@@ -1054,6 +1072,7 @@ static void sim7080g_task(void *pvParameters) {
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
 
     while (1) {
+#if CONFIG_VMFLOW_MODEM_ENABLE
         esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
 
         esp_err_t ret = esp_modem_sync(dce);
@@ -1084,6 +1103,7 @@ static void sim7080g_task(void *pvParameters) {
                 esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA);
             }
         }
+#endif
 
         xEventGroupWaitBits(xInternetEventGroup, BIT_PPP_GOT_IP | BIT_STA_GOT_IP, pdFALSE, pdFALSE, portMAX_DELAY);
         esp_mqtt_client_start(mqtt_client);
@@ -1148,6 +1168,16 @@ void app_main(void) {
 	esp_timer_create(&wifi_timer_args, &wifi_retry_timer);
 
 	esp_wifi_set_mode(WIFI_MODE_STA);
+
+	if (strlen(CONFIG_VMFLOW_DEV_WIFI_SSID) > 0) {
+		wifi_config_t wifi_config = {0};
+		strlcpy((char*) wifi_config.sta.ssid, CONFIG_VMFLOW_DEV_WIFI_SSID, sizeof(wifi_config.sta.ssid));
+		strlcpy((char*) wifi_config.sta.password, CONFIG_VMFLOW_DEV_WIFI_PASSWORD, sizeof(wifi_config.sta.password));
+		esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
+		ESP_LOGI(TAG, "Dev Wi-Fi from menuconfig, SSID= %s", wifi_config.sta.ssid);
+	}
+
 	esp_wifi_start();
 
     //-------------------------- SNTP --------------------------//
@@ -1158,8 +1188,8 @@ void app_main(void) {
 
 	//------------------------ BLUETOOTH -----------------------//
 	//----------------------------------------------------------//
-	char myhost[64];
-	strcpy(myhost, "0.vmflow.xyz");
+	char myhost[128];
+	strcpy(myhost, "0." CONFIG_VMFLOW_TOPIC_DOMAIN);
 
     nvs_handle_t handle;
 	if (nvs_open("vmflow", NVS_READONLY, &handle) == ESP_OK) {
@@ -1170,13 +1200,24 @@ void app_main(void) {
             if (nvs_get_str(handle, "domain", NULL, &s_len) == ESP_OK) {
                 nvs_get_str(handle, "domain", my_subdomain, &s_len);
 
-                snprintf(myhost, sizeof(myhost), "%s.vmflow.xyz", my_subdomain);
+                snprintf(myhost, sizeof(myhost), "%s." CONFIG_VMFLOW_TOPIC_DOMAIN, my_subdomain);
 
                 xEventGroupSetBits(xLedEventGroup, BIT_STATUS_PSSKEY | BIT_STATUS_DOMAIN | BIT_STATUS_TRIGGER);
             }
         }
 
 		nvs_close(handle);
+	}
+
+	if (strlen(CONFIG_VMFLOW_DEV_SUBDOMAIN) > 0 && strlen(CONFIG_VMFLOW_DEV_PASSKEY) > 0) {
+		strlcpy(my_subdomain, CONFIG_VMFLOW_DEV_SUBDOMAIN, sizeof(my_subdomain));
+		strlcpy(my_passkey, CONFIG_VMFLOW_DEV_PASSKEY, sizeof(my_passkey));
+
+		snprintf(myhost, sizeof(myhost), "%s." CONFIG_VMFLOW_TOPIC_DOMAIN, my_subdomain);
+
+		xEventGroupSetBits(xLedEventGroup, BIT_STATUS_PSSKEY | BIT_STATUS_DOMAIN | BIT_STATUS_TRIGGER);
+
+		ESP_LOGI(TAG, "Dev identity from menuconfig, HOST= %s", myhost);
 	}
 
 	// HMAC key tracks the passkey buffer by reference; later BLE provisioning writes into the same buffer and takes effect without re-registering.

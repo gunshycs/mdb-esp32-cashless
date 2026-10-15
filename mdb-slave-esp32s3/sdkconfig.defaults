@@ -1,3 +1,14 @@
+# Committed template. idf.py generates the local, git-ignored `sdkconfig` from
+# this file when it doesn't exist. Put your own values (broker, Wi-Fi, passkey)
+# in menuconfig: they land in `sdkconfig` and never reach git.
+# After changing project-wide settings, copy them here (idf.py save-defconfig
+# lists everything that differs from ESP-IDF defaults).
+
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # OTA: two-slot layout (esp_https_ota); no rollback.
 CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
 
@@ -8,3 +19,23 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # Dedicate APP_CPU (core 1) to the bit-banged MDB task: move WiFi to core 0
 # so it cannot preempt an MDB frame mid-transfer.
 CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+
+# BLE provisioning + PAX counter.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# Networking (Wi-Fi + SIM7080G PPP).
+CONFIG_ETH_USE_SPI_ETHERNET=n
+CONFIG_ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF=y
+CONFIG_LWIP_NETIF_STATUS_CALLBACK=y
+CONFIG_LWIP_ENABLE_LCP_ECHO=y
+CONFIG_LWIP_LCP_ECHOINTERVAL=10
+CONFIG_LWIP_LCP_MAXECHOFAILS=6
+CONFIG_LWIP_DNS_MAX_SERVERS=2
+
+# Per-developer settings: set these in menuconfig (VMflow -> Backend /
+# Development provisioning / SIM7080G), not here.
+#   CONFIG_VMFLOW_MQTT_BROKER_URI     required, build fails while empty
+#   CONFIG_VMFLOW_DEV_WIFI_SSID / _PASSWORD
+#   CONFIG_VMFLOW_DEV_SUBDOMAIN / _PASSKEY
+#   CONFIG_VMFLOW_MODEM_ENABLE        turn off on Wi-Fi-only boards

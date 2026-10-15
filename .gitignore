@@ -25,3 +25,6 @@ docker/vuejs/dist/
 
 # Fabrication Toolkit output (generated, not versioned)
 pcbway_production/
+
+# Firmware local config (broker, Wi-Fi, passkey); template is sdkconfig.defaults
+mdb-slave-esp32s3/sdkconfig
