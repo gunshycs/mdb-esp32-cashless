@@ -7,13 +7,15 @@
 # Commands with no parameter use "-" as <args>.
 #
 # Every command publishes to domain.<domain>/<sub>/rpc/* on completion.
+# credit replies "accepted,<sid>" or "rejected,<sid>,<reason>"; session events
+# (begin, vend_ok, vend_fail, end) follow on domain.<domain>/<sub>/session.
 # <domain> is DOMAIN (default vmflow.xyz) and must match CONFIG_VMFLOW_TOPIC_DOMAIN.
 # -w subscribes to rpc/# and captures the first reply regardless of subtopic.
 #
 # Usage:
 #   SUB=51 PASSKEY=af6c51a556fd71b345 ./rpc.sh info
 #   ./rpc.sh -s 51 -k af6c51a556fd71b345 dex
-#   ./rpc.sh -s 51 -k <key> -a 100 credit     # -a: command parameter (<args>)
+#   ./rpc.sh -s 51 -k <key> -w -a 150,a1b2c3 credit   # -a: <args>; credit = <cents>,<session-id>
 #   ./rpc.sh -s 51 -k <key> -w info           # -w: also wait for the reply
 #   ./rpc.sh -H 192.168.1.50 -d mybrand.io -s 51 -k <key> info   # own broker/domain
 #   ./rpc.sh -s 51 -k <key> -a v1.3.6 ota    # OTA to pinned tag

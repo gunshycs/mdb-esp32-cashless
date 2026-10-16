@@ -173,6 +173,21 @@ static char s_ip_ppp[16]  = "";
 #define RPC_FRESHNESS_SEC   10
 #define BLE_FRESHNESS_SEC   60
 
+// Payment sessions: credit:<cents>,<sid> starts one; events go out on .../session tagged with the sid.
+#define SESSION_ID_MAX      16
+#define CREDIT_TTL_SEC      10   // accepted credit must reach BEGIN SESSION within this, else "expired"
+#define SEEN_SIDS           16   // recent sids remembered to reject replays
+
+typedef struct {
+	uint16_t funds;              // MDB units; 0xffff = BLE "unlimited", approval comes over BLE
+	time_t   queued_at;
+	char     sid[SESSION_ID_MAX + 1];  // "" for BLE sessions (no MQTT events)
+} session_credit_t;
+
+static char session_sid[SESSION_ID_MAX + 1];       // active session, MDB task only
+static const char *session_end_reason = "completed";
+static char session_event[96];                     // built while handling an MDB command, published after the reply
+
 _Static_assert(sizeof(CONFIG_VMFLOW_MQTT_BROKER_URI) > 1, "Set VMflow -> Backend -> MQTT broker URI in menuconfig");
 _Static_assert(sizeof(CONFIG_VMFLOW_DEV_PASSKEY) == 1 || sizeof(CONFIG_VMFLOW_DEV_PASSKEY) == PASSKEY_LEN + 1, "VMflow -> Development provisioning -> passkey must be exactly 18 characters");
 
@@ -232,6 +247,53 @@ void write_payload_9(uint8_t *mdb_payload, uint8_t length) {
 
 	write_9(BIT_MODE_SET | checksum);
 }
+
+static int32_t pow10i(int n) {
+	int32_t r = 1;
+	while (n-- > 0) r *= 10;
+	return r;
+}
+
+// MDB value (scale factor + decimal places) <-> integer cents, no floating point.
+static uint32_t mdb_to_cents(uint16_t v) {
+	return (uint32_t) ((int64_t) v * CONFIG_MDB_SCALE_FACTOR * 100 / pow10i(CONFIG_MDB_DECIMAL_PLACES));
+}
+
+static bool cents_to_mdb(long cents, uint16_t *out) {
+	int64_t n = (int64_t) cents * pow10i(CONFIG_MDB_DECIMAL_PLACES);
+	int64_t d = 100 * CONFIG_MDB_SCALE_FACTOR;
+	if (cents <= 0 || n % d != 0 || n / d >= 0xffff) return false;  // 0xffff is the BLE "unlimited" sentinel
+	*out = (uint16_t) (n / d);
+	return true;
+}
+
+// Signed "<sid>,<fields>:<ts>:<hmac>" on domain.<domain>/<sub>/session. Queued here, sent by
+// session_event_flush() after the MDB reply so HMAC/MQTT/logging never delay the VMC response.
+static void session_event_queue(const char *sid, const char *fields) {
+	if (sid[0] == '\0') return;
+	snprintf(session_event, sizeof(session_event), "%s,%s:%lld", sid, fields, (long long) time(NULL));
+}
+
+static void session_event_flush(void) {
+	if (session_event[0] == '\0') return;
+
+	if (mqtt_client) {
+		char topic[128], line[192];
+		rpc_sign_text(session_event, line, sizeof(line));
+		snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/session", my_subdomain);
+		esp_mqtt_client_enqueue(mqtt_client, topic, line, 0, 1, 0, 1);
+	}
+	ESP_LOGI(TAG, "session event: %s", session_event);
+	session_event[0] = '\0';
+}
+
+static void session_close(const char *reason) {
+	char fields[32];
+	snprintf(fields, sizeof(fields), "end,%s", reason);
+	session_event_queue(session_sid, fields);
+	session_sid[0] = '\0';
+}
+
 void mdb_cashless_task(void *pvParameters) {
 	// Install the RX edge ISR from this task so the GPIO interrupt is allocated
 	// on this task's core (APP_CPU/core 1), isolated from core-0 network ISRs
@@ -241,6 +303,7 @@ void mdb_cashless_task(void *pvParameters) {
 
 	time_t session_begin_time = 0;
 
+	session_credit_t credit;
 	uint16_t funds_available = 0;
 	uint16_t item_price = 0;
 	uint16_t item_number = 0;
@@ -269,6 +332,8 @@ void mdb_cashless_task(void *pvParameters) {
 
 			cashless_reset_todo = true;
 			machine_state = INACTIVE_STATE;
+
+			if (session_sid[0]) session_close("aborted");
 
 			xEventGroupClearBits(xLedEventGroup, BIT_STATUS_MDB);
 			xEventGroupSetBits(xLedEventGroup, BIT_STATUS_TRIGGER);
@@ -325,8 +390,17 @@ void mdb_cashless_task(void *pvParameters) {
 				mdb_payload[0] = 0x00;
 				available_tx = 1;
 
-			} else if (machine_state <= ENABLED_STATE && xQueueReceive(mdb_session_queue, &funds_available, 0)) {
+			} else if (machine_state == ENABLED_STATE && xQueueReceive(mdb_session_queue, &credit, 0)) {
 				session_begin_todo = false;
+
+				if (time(NULL) - credit.queued_at > CREDIT_TTL_SEC) {
+					session_event_queue(credit.sid, "end,expired");
+					break;
+				}
+
+				funds_available = credit.funds;
+				strlcpy(session_sid, credit.sid, sizeof(session_sid));
+				session_end_reason = "completed";
 
 				machine_state = IDLE_STATE;
 
@@ -336,6 +410,12 @@ void mdb_cashless_task(void *pvParameters) {
 				available_tx = 3;
 
 				time( &session_begin_time);
+
+				if (funds_available != 0xffff) {
+					char fields[24];
+					snprintf(fields, sizeof(fields), "begin,%lu", (unsigned long) mdb_to_cents(funds_available));
+					session_event_queue(session_sid, fields);
+				}
 
 			} else if (session_cancel_todo) {
 				session_cancel_todo = false;
@@ -374,8 +454,11 @@ void mdb_cashless_task(void *pvParameters) {
 			} else {
 				time_t now = time(NULL);
 
-				if (machine_state >= IDLE_STATE && (now - session_begin_time) > 60) {
+				// Walk-away: only from session idle, never mid-vend. Re-arms in case the VMC ignores the cancel.
+				if (machine_state == IDLE_STATE && (now - session_begin_time) > CONFIG_VMFLOW_SESSION_TIMEOUT_S) {
 					session_cancel_todo = true;
+					session_end_reason = "timeout";
+					session_begin_time = now;
 				}
 			}
 
@@ -424,6 +507,10 @@ void mdb_cashless_task(void *pvParameters) {
 				last_sale_item  = item_number;
 				last_vend_success_time = time(NULL);
 
+				char fields[32];
+				snprintf(fields, sizeof(fields), "vend_ok,%lu,%u", (unsigned long) mdb_to_cents(item_price), item_number);
+				session_event_queue(session_sid, fields);
+
 				uint8_t payload[19];
 				ble_encode_with_passkey(0x0b, item_price, item_number, payload);
 				ble_notify_send((char*) payload, sizeof(payload));
@@ -446,12 +533,17 @@ void mdb_cashless_task(void *pvParameters) {
                 snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/vend_fail", my_subdomain);
                 esp_mqtt_client_enqueue(mqtt_client, topic, line, 0, 1, 0, 1);
 
+				char fields[32];
+				snprintf(fields, sizeof(fields), "vend_fail,%lu,%u", (unsigned long) mdb_to_cents(item_price), item_number);
+				session_event_queue(session_sid, fields);
+
 				break;
 			}
 			case SESSION_COMPLETE: {
 				if (read_9(NULL) != checksum) continue;
 
 				session_end_todo = true;
+				session_close(session_end_reason);
 
 				uint8_t payload[19];
 				ble_encode_with_passkey(0x0d, item_price, item_number, payload);
@@ -466,7 +558,7 @@ void mdb_cashless_task(void *pvParameters) {
 
 				if (read_9(NULL) != checksum) continue;
 
-				uint32_t price_wire = TO_SCALE_FACTOR( FROM_SCALE_FACTOR(item_price, CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES), 1, 2);
+				uint32_t price_wire = mdb_to_cents(item_price);
 
 				char topic[128], msg[64], line[160];
 				snprintf(msg, sizeof(msg), "%lu:%u:%lld", (unsigned long) price_wire, item_number, (long long) time(NULL));
@@ -488,6 +580,8 @@ void mdb_cashless_task(void *pvParameters) {
 				if (read_9(NULL) != checksum) continue;
 
 				machine_state = DISABLED_STATE;
+
+				if (session_sid[0]) session_close("aborted");
 
 				xEventGroupClearBits(xLedEventGroup, BIT_STATUS_MDB);
 				xEventGroupSetBits(xLedEventGroup, BIT_STATUS_TRIGGER);
@@ -543,6 +637,7 @@ void mdb_cashless_task(void *pvParameters) {
 		}
 
 		write_payload_9(mdb_payload, available_tx);
+		session_event_flush();
 	}
 }
 
@@ -555,7 +650,8 @@ void mdb_cashless_task(void *pvParameters) {
  *   (never empty): commands without an argument send "-" as a sentinel. Commands:
  *     dex:-            trigger an on-demand DEX/telemetry read
  *     info:-           publish device snapshot JSON on .../rpc/info
- *     credit:<amount>  grant credit (amount scaled to 1/100 units)
+ *     credit:<cents>,<sid>  start a payment session; signed "accepted,<sid>" or
+ *                      "rejected,<sid>,<bad_args|bad_amount|duplicate|busy|not_ready>" on .../rpc/credit
  *     oos:-            send MDB "command out of sequence" to the VMC
  *     echo:-           reply <ts> on .../rpc/echo (liveness + RTT probe)
  *     buzzer:-         1s beep
@@ -564,7 +660,12 @@ void mdb_cashless_task(void *pvParameters) {
  *                      over HTTPS; progress on .../rpc/ota, then reboot
  *
  * Outbound — signed text "<fields>:<ts>:<hmac_hex>":
- *     sale  "<price>:<item>:<ts>:<hmac>"  on  .../sale
+ *     session "<sid>,begin,<cents>"            credit reached the VMC (BEGIN SESSION)
+ *             "<sid>,vend_ok,<cents>,<item>"   product dropped -> capture <cents>
+ *             "<sid>,vend_fail,<cents>,<item>" vend failed
+ *             "<sid>,end,<completed|timeout|aborted|expired>"   session over -> cancel if no vend_ok
+ *                                                  (each + ":<ts>:<hmac>")  on  .../session
+ *     sale  "<price>:<item>:<ts>:<hmac>"  on  .../sale   (cash sales)
  *     pax   "<count>:<ts>:<hmac>"         on  .../paxcounter
  *
  * BLE wire payload (phone app) — 19 bytes:
@@ -704,10 +805,11 @@ void ble_event_handler(char *ble_payload) {
 
         break;
     }
-    case 0x02:
-        uint16_t funds_available = 0xffff;
-		xQueueSend(mdb_session_queue, &funds_available, 0);
+    case 0x02: {
+        session_credit_t credit = { .funds = 0xffff, .queued_at = time(NULL) };
+		xQueueSend(mdb_session_queue, &credit, 0);
 		break;
+    }
 	case 0x03:
 
         if(ble_decode_with_passkey(NULL, NULL, (uint8_t*) ble_payload) == ESP_OK){
@@ -774,6 +876,63 @@ static void ota_task(void *arg) {
 	} else {
 		ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
 		vTaskDelete(NULL);
+	}
+}
+
+static char seen_sids[SEEN_SIDS][SESSION_ID_MAX + 1];
+static int  seen_sids_next = 0;
+
+static bool sid_seen(const char *sid) {
+	for (int i = 0; i < SEEN_SIDS; i++)
+		if (strcmp(seen_sids[i], sid) == 0) return true;
+	return false;
+}
+
+// "credit:<cents>,<sid>". Replies signed "accepted,<sid>" or "rejected,<sid>,<reason>" on .../rpc/credit;
+// only accepts when the VMC has the reader enabled and no other session is pending or active.
+static void rpc_credit(const char *args) {
+	char sid[SESSION_ID_MAX + 2] = "-";
+	long cents = 0;
+	int end = 0;
+	const char *reason = NULL;
+	session_credit_t credit = {0};
+
+	if (sscanf(args, "%ld,%17[A-Za-z0-9_-]%n", &cents, sid, &end) != 2 || args[end] != '\0' || strlen(sid) > SESSION_ID_MAX) {
+		strcpy(sid, "-");
+		reason = "bad_args";
+	} else if (sid_seen(sid)) {
+		reason = "duplicate";
+	} else {
+		// Remember every validly signed sid, accepted or not, so a rejected credit can't be replayed later.
+		strlcpy(seen_sids[seen_sids_next], sid, sizeof(seen_sids[0]));
+		seen_sids_next = (seen_sids_next + 1) % SEEN_SIDS;
+
+		if (!cents_to_mdb(cents, &credit.funds)) {
+			reason = "bad_amount";
+		} else if (machine_state > ENABLED_STATE || uxQueueMessagesWaiting(mdb_session_queue) > 0) {
+			reason = "busy";
+		} else if (machine_state != ENABLED_STATE) {
+			reason = "not_ready";
+		} else {
+			credit.queued_at = time(NULL);
+			strlcpy(credit.sid, sid, sizeof(credit.sid));
+			if (xQueueSend(mdb_session_queue, &credit, 0) != pdTRUE) reason = "busy";
+		}
+	}
+
+	char msg[64], line[160], topic[128];
+	if (reason) snprintf(msg, sizeof(msg), "rejected,%s,%s:%lld", sid, reason, (long long) time(NULL));
+	else        snprintf(msg, sizeof(msg), "accepted,%s:%lld", sid, (long long) time(NULL));
+	rpc_sign_text(msg, line, sizeof(line));
+
+	snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/rpc/credit", my_subdomain);
+	esp_mqtt_client_enqueue(mqtt_client, topic, line, 0, 1, 0, 1);
+
+	if (reason) {
+		ESP_LOGW(TAG, "RPC credit rejected: %s (sid=%s)", reason, sid);
+	} else {
+		xEventGroupSetBits(xLedEventGroup, BIT_STATUS_BUZZER | BIT_STATUS_TRIGGER);
+		ESP_LOGI(TAG, "RPC credit accepted: %ld cents (sid=%s)", cents, sid);
 	}
 }
 
@@ -883,14 +1042,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 				rpc_publish_info();
 				ESP_LOGI(TAG, "RPC info published");
 			} else if (strcmp(cmd, "credit") == 0 && has_args) {
-				int32_t price_wire = (int32_t) strtol(args, NULL, 10);
-				uint16_t funds_available = TO_SCALE_FACTOR( FROM_SCALE_FACTOR(price_wire, 1, 2), CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES);
-
-				xQueueSend(mdb_session_queue, &funds_available, 0);
-				xEventGroupSetBits(xLedEventGroup, BIT_STATUS_BUZZER | BIT_STATUS_TRIGGER);
-
-                esp_mqtt_client_enqueue(mqtt_client, topic_confirm, "ok", 0, 1, 0, 1);
-				ESP_LOGI( TAG, "RPC credit: Amount= %f", FROM_SCALE_FACTOR(funds_available, CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES) );
+				rpc_credit(args);
 			} else if (strcmp(cmd, "oos") == 0) {
 				out_of_sequence_todo = true;
 
@@ -1251,7 +1403,7 @@ void app_main(void) {
     };
     gpio_config(&io_conf);
 
-    mdb_session_queue = xQueueCreate(1, sizeof(uint16_t));
+    mdb_session_queue = xQueueCreate(1, sizeof(session_credit_t));
 
     // Bit-banged MDB pinned alone to core 1 at high prio so core-0 network never preempts a frame.
     xTaskCreatePinnedToCore(mdb_cashless_task, "mdb_cashless_task", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1);

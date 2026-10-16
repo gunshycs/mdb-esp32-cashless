@@ -69,6 +69,15 @@ menu "MDB Cashless Device"
         default 2
         range 0 3
 
+    config VMFLOW_SESSION_TIMEOUT_S
+        int "Session idle timeout (seconds)"
+        default 60
+        range 10 600
+        help
+            After BEGIN SESSION, if no product is selected within this time the reader
+            sends SESSION CANCEL and reports "end,timeout". Keep the backend's
+            payment-authorization cancel timer slightly longer than this.
+
 endmenu # MDB Cashless Device
 
 menu "Backend"
