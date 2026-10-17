@@ -69,9 +69,87 @@ menu "MDB Cashless Device"
         default 2
         range 0 3
 
+    config VMFLOW_SESSION_TIMEOUT_S
+        int "Session idle timeout (seconds)"
+        default 60
+        range 10 600
+        help
+            After BEGIN SESSION, if no product is selected within this time the reader
+            sends SESSION CANCEL and reports "end,timeout". Keep the backend's
+            payment-authorization cancel timer slightly longer than this.
+
 endmenu # MDB Cashless Device
 
+menu "Backend"
+
+    config VMFLOW_MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default ""
+        help
+            Broker the device connects to, e.g. mqtt://192.168.1.50 for the bench Pi
+            or mqtts://broker.example.com:8883 later. Required: the build fails while
+            this is empty, so a fresh build can never fall back to a third-party broker.
+
+    config VMFLOW_TOPIC_DOMAIN
+        string "MQTT topic domain"
+        default "vmflow.xyz"
+        help
+            Topic namespace (not a hostname). The device subscribes to
+            <subdomain>.<domain>/rpc and publishes to domain.<domain>/<subdomain>/...
+            Also used for the BLE device name. Keep it in sync with the backend and rpc.sh.
+
+    config VMFLOW_OTA_BASE_URL
+        string "OTA base URL"
+        default ""
+        help
+            The ota RPC downloads <base>/<tag>/mdb-slave-esp32s3.bin, with tag "latest"
+            when none is given. Leave empty to disable OTA.
+
+    config VMFLOW_LOG_SECRETS
+        bool "Log passkey and Wi-Fi password (dev builds only)"
+        default n
+
+endmenu # Backend
+
+menu "Development provisioning"
+
+    config VMFLOW_DEV_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Bench Wi-Fi network, applied at boot instead of BLE provisioning.
+            Leave empty to use whatever the device has stored. Lives only in your
+            local sdkconfig; don't commit it.
+
+    config VMFLOW_DEV_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config VMFLOW_DEV_SUBDOMAIN
+        string "Device subdomain (ID)"
+        default ""
+        help
+            Device ID used in MQTT topics, e.g. 51. Set together with the passkey to
+            override the identity stored in NVS. Leave both empty to use NVS.
+
+    config VMFLOW_DEV_PASSKEY
+        string "Device passkey (18 chars)"
+        default ""
+        help
+            HMAC key for RPC signing. Must be exactly 18 characters. Use the same
+            value in rpc.sh / the Pi script. Dev only; don't commit it.
+
+endmenu # Development provisioning
+
 menu "SIM7080G"
+
+    config VMFLOW_MODEM_ENABLE
+        bool "Probe for a SIM7080G modem at boot"
+        default y
+        help
+            Power-cycles and syncs the SIM7080G (~8 s) before MQTT starts, and uses
+            cellular (PPP) when it registers. Turn off on Wi-Fi-only boards so MQTT
+            starts as soon as Wi-Fi has an IP.
 
     choice
         prompt "LTE Network Mode"

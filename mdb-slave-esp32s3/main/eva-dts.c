@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <sdkconfig.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -449,8 +450,8 @@ static void eva_dts_task(void *arg) {
 	uint8_t *dex = (uint8_t*) xRingbufferReceive(dex_ringbuf, &dex_size, 0);
 
     if(dex != NULL){
-        char topic[64];
-        snprintf(topic, sizeof(topic), "domain.vmflow.xyz/%s/rpc/dex", my_subdomain);
+        char topic[128];
+        snprintf(topic, sizeof(topic), "domain." CONFIG_VMFLOW_TOPIC_DOMAIN "/%s/rpc/dex", my_subdomain);
 
         esp_mqtt_client_publish(mqtt_client, topic, (char*) dex, dex_size, 0, 0);
         printf("%.*s", dex_size, (char*) dex);
