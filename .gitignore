@@ -28,3 +28,6 @@ pcbway_production/
 
 # Firmware local config (broker, Wi-Fi, passkey); template is sdkconfig.defaults
 mdb-slave-esp32s3/sdkconfig
+
+# Claude Code personal settings
+.claude/settings.local.json
