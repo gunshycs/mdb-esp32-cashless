@@ -162,6 +162,11 @@ bool vend_denied_todo = false;
 bool cashless_reset_todo = false;
 bool out_of_sequence_todo = false;
 
+#if CONFIG_VMFLOW_MDB_DIAG
+// Frame-start counters: commands to our address by low 3 bits, other addresses, VMC ACKs.
+static volatile uint32_t diag_ours[8], diag_other_addr, diag_ack, diag_data;
+#endif
+
 uint16_t last_sale_price = 0;
 uint16_t last_sale_item = 0;
 
@@ -294,6 +299,29 @@ static void session_close(const char *reason) {
 	session_sid[0] = '\0';
 }
 
+#if CONFIG_VMFLOW_MDB_DIAG
+static void mdb_diag_tx_test(void) {
+	for (int round = 1; round <= 3; round++) {
+		gpio_set_level(PIN_MDB_TX, 0);
+		ESP_LOGW(TAG, "DIAG %d/3: TX opto ON  (pin 4 should be pulled LOW to pin 6) for 10 s", round);
+		vTaskDelay(pdMS_TO_TICKS(10000));
+		gpio_set_level(PIN_MDB_TX, 1);
+		ESP_LOGW(TAG, "DIAG %d/3: TX opto OFF (pin 4 released, idle HIGH) for 10 s", round);
+		vTaskDelay(pdMS_TO_TICKS(10000));
+	}
+	ESP_LOGW(TAG, "DIAG: TX test done, starting MDB");
+}
+
+static void mdb_diag_task(void *pvParameters) {
+	for (;;) {
+		vTaskDelay(pdMS_TO_TICKS(5000));
+		ESP_LOGW(TAG, "DIAG ours: reset=%lu setup=%lu poll=%lu vend=%lu reader=%lu exp=%lu | vmc_ack=%lu other_addr=%lu data=%lu",
+				diag_ours[RESET], diag_ours[SETUP], diag_ours[POLL], diag_ours[VEND], diag_ours[READER],
+				diag_ours[EXPANSION], diag_ack, diag_other_addr, diag_data);
+	}
+}
+#endif
+
 void mdb_cashless_task(void *pvParameters) {
 	// Install the RX edge ISR from this task so the GPIO interrupt is allocated
 	// on this task's core (APP_CPU/core 1), isolated from core-0 network ISRs
@@ -315,6 +343,13 @@ void mdb_cashless_task(void *pvParameters) {
 		uint8_t checksum = 0x00;
 
 		uint16_t coming_read = read_9(&checksum);
+
+#if CONFIG_VMFLOW_MDB_DIAG
+		if (!(coming_read & BIT_MODE_SET)) diag_data++;
+		else if ((uint8_t) coming_read == ACK) diag_ack++;
+		else if ((coming_read & BIT_ADD_SET) == CONFIG_CASHLESS_DEVICE_ADDRESS) diag_ours[coming_read & BIT_CMD_SET]++;
+		else diag_other_addr++;
+#endif
 
 		if (!(coming_read & BIT_MODE_SET)) continue;
 
@@ -1404,6 +1439,11 @@ void app_main(void) {
     gpio_config(&io_conf);
 
     mdb_session_queue = xQueueCreate(1, sizeof(session_credit_t));
+
+#if CONFIG_VMFLOW_MDB_DIAG
+    mdb_diag_tx_test();
+    xTaskCreatePinnedToCore(mdb_diag_task, "mdb_diag_task", 3072, NULL, 1, NULL, 0);
+#endif
 
     // Bit-banged MDB pinned alone to core 1 at high prio so core-0 network never preempts a frame.
     xTaskCreatePinnedToCore(mdb_cashless_task, "mdb_cashless_task", 8192, NULL, configMAX_PRIORITIES - 2, NULL, 1);
