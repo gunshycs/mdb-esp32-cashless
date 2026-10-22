@@ -78,6 +78,16 @@ menu "MDB Cashless Device"
             sends SESSION CANCEL and reports "end,timeout". Keep the backend's
             payment-authorization cancel timer slightly longer than this.
 
+    config VMFLOW_MDB_DIAG
+        bool "MDB diagnostics (TX line test + traffic counters)"
+        default n
+        help
+            Bench aid, keep off in production. At boot, before MDB starts, the TX
+            optocoupler is held ON (line pulled low) then OFF for 10 s each, three
+            times, so MDB pin 4 (Master Receive) vs pin 6 (Common) can be measured
+            with a multimeter. Then logs every 5 s how many commands the VMC sent to
+            this address (RESET/SETUP/POLL/...), to other addresses, and its ACKs.
+
 endmenu # MDB Cashless Device
 
 menu "Backend"
